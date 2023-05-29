@@ -1,40 +1,66 @@
-import requests
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.views import APIView
+from rest_framework.viewsets import ViewSet
 
+from .exceptions import FileConvertError, InvalidAudioFileFormat, InvalidUser
 from .models import Audio, Uploader
 from .serializers import AudioSerializer, UploaderSerializer
-from .utils import convert_audio
 
 
-class UploaderView(APIView):
+class UploaderView(ViewSet):
+    serializer_class = UploaderSerializer
 
-    def post(self, request):
+    def create(self, request):
         serializer = UploaderSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        queryset = Uploader.objects.filter(username=request.data['username'])
-        if not queryset.exists():
-            serializer.save()
-            response = queryset.values('user_id', 'user_token')
-            return Response(response, status=status.HTTP_200_OK)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        response = {
+            "id": serializer.data['user_id'],
+            "user_token": serializer.data['user_token']}
+        return Response(response, status=status.HTTP_201_CREATED)
 
 
-class AudioView(APIView):
+class AudioView(ViewSet):
+    serializer_class = AudioSerializer
 
-    def post(self, request):
-        user = Uploader.objects.filter(
-                user_token=request.data['user_token'],
-                user_id=request.data['user_id'],
-                ).exists()
-        if user:
-            audio_mp3 = convert_audio(request.files['audio_file'])
-            serializer = AudioSerializer(data=request.data, files=audio_mp3)
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-            audio_obj = Audio.objects.filter(
-                user_id=serializer.data['user_id']).last()
-            response = {'url': f'http://localhost:8000/record?id={audio_obj.id}&user={audio_obj.user_id}'}
-            return Response(response, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_401_UNAUTHORIZED)
+    def create(self, request):
+        user_id = request.data.get('user_id', 0)
+        user_token = request.META.get('HTTP_X_USER_TOKEN', "")
+
+        try:
+            Uploader.get_valid(user_id, user_token)
+        except InvalidUser:
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = AudioSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        audio = serializer.save()
+
+        try:
+            url = audio.convert()
+            return Response(
+                {'url': request.build_absolute_uri(url)},
+                status=status.HTTP_201_CREATED)
+        except InvalidAudioFileFormat as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_406_NOT_ACCEPTABLE)
+        except FileConvertError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class RecordView(ViewSet):
+    serializer_class = AudioSerializer
+
+    def get(self, request):
+        id = request.GET.get('id')
+        user_id = request.GET.get('user')
+        audio = Audio.objects.filter(id=id, user_id=user_id)
+        if not audio:
+            response = {'error': 'Audio not found'}
+            return Response(response, status=status.HTTP_404_NOT_FOUND)
+        obj = Audio.objects.get(id=id, user_id=user_id)
+        response = obj.download()
+        return response
